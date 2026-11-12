@@ -1,6 +1,6 @@
 name: Refresh
 on:
-  # modified: every 6 hours (was every 2 hours, per Ken 2026-11-12)
+  # modified: every 6 hours (was every 2 hours, per Ken 2026-11-12); no --skip so Refresh does a real mihomo liveness check (Ken 2026-11-12: all nodes were dead)
   schedule:
     - cron: "0 */6 * * *"
   workflow_dispatch:
@@ -65,7 +65,7 @@ jobs:
           fi
 
       - name: Refresh
-        run: python -u subscribe/collect.py --all --refresh --overwrite --skip
+        run: python -u subscribe/collect.py --all --refresh --overwrite
 
       - name: Timestamp
         run: date
