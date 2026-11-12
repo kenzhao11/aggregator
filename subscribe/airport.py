@@ -792,14 +792,13 @@ class AirPort:
             v2ray_file = os.path.join(PATH, "subconverter", f"{artifact}.txt")
             clash_file = os.path.join(PATH, "subconverter", f"{artifact}.yaml")
 
-            # base64 encoding if all lines start with valid protocol
-            if (
-                not is_b64encode
-                and not is_json
-                and not is_yaml
-                and all(AirPort.check_protocol(x) for x in text.split("\n") if x and not x.startswith("#"))
-            ):
-                text = base64.b64encode(text.encode(encoding="UTF8")).decode(encoding="UTF8")
+            # base64 encoding if lines start with valid protocol
+            # 只保留协议链接行：单条脏数据（如密码含 []）不再拖垮整个订阅
+            if not is_b64encode and not is_json and not is_yaml:
+                lines = [x for x in text.split("\n") if x and not x.startswith("#")]
+                valid_lines = [x for x in lines if AirPort.check_protocol(x)]
+                if valid_lines:
+                    text = base64.b64encode("\n".join(valid_lines).encode(encoding="UTF8")).decode(encoding="UTF8")
 
             try:
                 with open(v2ray_file, "w+", encoding="UTF8") as f:
