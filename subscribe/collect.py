@@ -192,6 +192,82 @@ def assign(
     return tasks
 
 
+# --- Region-based trim (kenzhao11 fork): keep the subscription small ---
+# Cap the generated Clash/V2Ray/Sing-box output to ~50-70 nodes across 10
+# regions (US/JP/SG/HK weighted), so the subscription does not balloon to
+# thousands of nodes. Nodes are classified by region from their name
+# (airport subscriptions usually carry a region name/flag). Unknown-region
+# nodes only fill the total up to the cap. Fail-safe: on any error the
+# untrimmed list is returned unchanged.
+TRIM_TARGETS = {"US": 12, "JP": 10, "SG": 10, "HK": 10, "TW": 4, "KR": 4, "DE": 5, "UK": 4, "FR": 4, "MY": 3}
+
+REGION_PATTERNS = {
+    "HK": ["香港", "🇭🇰", "Hong Kong", "HongKong"],
+    "TW": ["台湾", "台灣", "🇹🇼", "Taiwan"],
+    "JP": ["日本", "🇯🇵", "Japan", "东京", "東京", "大阪", "Tokyo", "Osaka"],
+    "KR": ["韩国", "韓國", "🇰🇷", "Korea", "首尔", "Seoul"],
+    "US": ["美国", "🇺🇸", "USA", "America", "United States", "洛杉矶", "Los Angeles", "纽约", "New York", "旧金山", "San Francisco", "西雅图", "Seattle", "芝加哥", "Chicago"],
+    "DE": ["德国", "🇩🇪", "Germany", "法兰克福", "Frankfurt", "Berlin", "柏林"],
+    "UK": ["英国", "🇬🇧", "England", "United Kingdom", "伦敦", "London"],
+    "FR": ["法国", "🇫🇷", "France", "巴黎", "Paris"],
+    "SG": ["新加坡", "🇸🇬", "Singapore"],
+    "MY": ["马来西亚", "🇲🇾", "Malaysia", "吉隆坡", "Kuala Lumpur"],
+}
+
+_PROTO_RANK = {"vless": 0, "trojan": 1, "ss": 2, "vmess": 3, "hysteria2": 4, "hysteria": 5}
+
+
+def _region_from_name(name: str) -> str:
+    n = str(name or "")
+    for code, pats in REGION_PATTERNS.items():
+        for p in pats:
+            if p in n:
+                return code
+    return ""
+
+
+def trim_proxies_by_region(nodes: list, targets: dict = None) -> list:
+    try:
+        targets = targets or TRIM_TARGETS
+        total_cap = sum(targets.values())
+        by_region = {}
+        unknown = []
+        for nd in nodes:
+            r = _region_from_name(nd.get("name", "")) if isinstance(nd, dict) else ""
+            if r in targets:
+                by_region.setdefault(r, []).append(nd)
+            else:
+                unknown.append(nd)
+
+        def _rank(nd):
+            delay = nd.get("delay") if isinstance(nd, dict) else None
+            has_delay = 0 if isinstance(delay, (int, float)) else 1
+            d = float(delay) if isinstance(delay, (int, float)) else 0.0
+            proto = str(nd.get("type", "")).lower() if isinstance(nd, dict) else ""
+            return (has_delay, d, _PROTO_RANK.get(proto, 9))
+
+        kept = []
+        for code, want in targets.items():
+            cands = sorted(by_region.get(code, []), key=_rank)
+            kept.extend(cands[:want])
+        if len(kept) < total_cap and unknown:
+            unknown_sorted = sorted(unknown, key=_rank)
+            kept.extend(unknown_sorted[: total_cap - len(kept)])
+        seen = set()
+        out = []
+        for nd in kept:
+            key = (str(nd.get("server", "")), str(nd.get("port", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(nd)
+        logger.info(f"trim proxies by region: {len(nodes)} -> {len(out)}")
+        return out
+    except Exception as e:
+        logger.error(f"trim proxies by region failed ({e}), keep untrimmed proxies")
+        return nodes
+
+
 def aggregate(args: argparse.Namespace) -> None:
     def parse_gist_link(link: str) -> tuple[str, str]:
         # 提取 gist 用户名及 id
@@ -293,6 +369,9 @@ def aggregate(args: argparse.Namespace) -> None:
         if len(nodes) <= 0:
             logger.error(f"cannot fetch any proxy")
             sys.exit(0)
+
+    # Trim to ~50-70 nodes across 10 regions (fail-safe inside).
+    nodes = trim_proxies_by_region(nodes)
 
     subscriptions = set()
     for p in proxies:
