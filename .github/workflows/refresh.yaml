@@ -1,8 +1,8 @@
 name: Refresh
 on:
-  # performed every two hours
+  # modified: every 6 hours (was every 2 hours, per Ken 2026-11-12)
   schedule:
-    - cron: "0 */2 * * *"
+    - cron: "0 */6 * * *"
   workflow_dispatch:
 
 concurrency:
