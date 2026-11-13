@@ -381,13 +381,65 @@ def trim_proxies_by_region(nodes: list, targets: dict = None) -> list:
             proto = str(nd.get("type", "")).lower() if isinstance(nd, dict) else ""
             return (tls443, has_fetch, f, has_delay, d, _PROTO_RANK.get(proto, 9))
 
+        def _identity(nd):
+            """Server identity: same UUID/password (+ Reality key) means the
+            same operator/server, even on a different IP. Keeping 9 copies
+            of one farm adds no diversity; if that farm is blocked, all 9
+            die together."""
+            if not isinstance(nd, dict):
+                return None
+            ident = str(nd.get("uuid") or nd.get("password") or nd.get("auth") or "")
+            ropts = nd.get("reality-opts")
+            if isinstance(ropts, dict) and ropts.get("public-key"):
+                ident += "|" + str(ropts["public-key"])
+            return ident or None
+
+        def _subnet(nd):
+            """The /24 of an IP server, or the domain itself."""
+            server = str(nd.get("server", "")) if isinstance(nd, dict) else ""
+            parts = server.split(".")
+            if len(parts) == 4 and all(p.isdigit() for p in parts):
+                return ".".join(parts[:3]) + ".0/24"
+            return server
+
+        seen_id = set()
+        subnet_count = {}
+
+        def _pick(cands, want, subnet_cap=2):
+            """Pick up to `want` nodes, skipping ones whose server identity
+            was already picked and (when subnet_cap is set) ones from a
+            /24 that already contributed `subnet_cap` nodes."""
+            picked = []
+            for nd in cands:
+                if len(picked) >= want:
+                    break
+                ident = _identity(nd)
+                if ident and ident in seen_id:
+                    continue
+                sub = _subnet(nd)
+                if subnet_cap is not None and subnet_count.get(sub, 0) >= subnet_cap:
+                    continue
+                if ident:
+                    seen_id.add(ident)
+                subnet_count[sub] = subnet_count.get(sub, 0) + 1
+                picked.append(nd)
+            return picked
+
         kept = []
         for code, want in targets.items():
             cands = sorted(by_region.get(code, []), key=_rank)
-            kept.extend(cands[:want])
+            picked = _pick(cands, want, subnet_cap=2)
+            if len(picked) < want:
+                picked += _pick(cands, want - len(picked), subnet_cap=None)
+            kept.extend(picked)
         if len(kept) < total_cap and unknown:
             unknown_sorted = sorted(unknown, key=_rank)
-            kept.extend(unknown_sorted[: total_cap - len(kept)])
+            picked = _pick(unknown_sorted, total_cap - len(kept), subnet_cap=2)
+            if len(picked) < total_cap - len(kept):
+                picked += _pick(
+                    unknown_sorted, total_cap - len(kept) - len(picked), subnet_cap=None
+                )
+            kept.extend(picked)
         seen = set()
         out = []
         for nd in kept:
