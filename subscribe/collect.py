@@ -342,6 +342,7 @@ def trim_proxies_by_region(nodes: list, targets: dict = None) -> list:
                 r = _region_from_egress_ip(nd, reader)
                 if not r:
                     r = _region_from_name(nd.get("name", ""))
+                nd["_region"] = r
             if r in targets:
                 by_region.setdefault(r, []).append(nd)
             else:
@@ -369,7 +370,34 @@ def trim_proxies_by_region(nodes: list, targets: dict = None) -> list:
                 continue
             seen.add(key)
             out.append(nd)
-        logger.info(f"trim proxies by region: {len(nodes)} -> {len(out)}")
+        # Label kept nodes with their real region so the subscription shows
+        # which node is US/JP/SG/... instead of generic VLESS-xxx names.
+        region_label = {
+            "US": "🇺🇸 美国",
+            "JP": "🇯🇵 日本",
+            "SG": "🇸🇬 新加坡",
+            "HK": "🇭🇰 香港",
+            "TW": "🇹🇼 台湾",
+            "KR": "🇰🇷 韩国",
+            "DE": "🇩🇪 德国",
+            "UK": "🇬🇧 英国",
+            "FR": "🇫🇷 法国",
+            "MY": "🇲🇾 马来西亚",
+        }
+        counts = {}
+        for nd in out:
+            r = nd.pop("_region", "") if isinstance(nd, dict) else ""
+            if isinstance(nd, dict):
+                nd.pop("egress_ip", None)
+            if r in region_label:
+                counts[r] = counts.get(r, 0) + 1
+                nd["name"] = f"{region_label[r]} {counts[r]:02d}"
+        breakdown = ", ".join(f"{k}={v}" for k, v in sorted(counts.items()))
+        logger.info(
+            f"trim proxies by region: {len(nodes)} -> {len(out)}"
+            + (f" [{breakdown}]" if breakdown else "")
+            + f", unknown={len(out) - sum(counts.values())}"
+        )
         return out
     except Exception as e:
         logger.error(f"trim proxies by region failed ({e}), keep untrimmed proxies")
