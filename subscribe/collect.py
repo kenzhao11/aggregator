@@ -4,6 +4,7 @@
 # @Time    : 2022-07-15
 
 import argparse
+from functools import partial
 import itertools
 import os
 import random
@@ -28,6 +29,7 @@ from urlvalidator import isurl
 from workflow import TaskConfig
 
 import clash
+import location
 import subconverter
 
 PATH = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
@@ -193,13 +195,14 @@ def assign(
 
 
 # --- Region-based trim (kenzhao11 fork): keep the subscription small ---
-# Cap the generated Clash/V2Ray/Sing-box output to ~50-70 nodes across 10
-# regions (US/JP/SG/HK weighted), so the subscription does not balloon to
-# thousands of nodes. Nodes are classified by region from their name
-# (airport subscriptions usually carry a region name/flag). Unknown-region
-# nodes only fill the total up to the cap. Fail-safe: on any error the
-# untrimmed list is returned unchanged.
-TRIM_TARGETS = {"US": 12, "JP": 10, "SG": 10, "HK": 10, "TW": 4, "KR": 4, "DE": 5, "UK": 4, "FR": 4, "MY": 3}
+# Cap the generated Clash/V2Ray/Sing-box output to ~50-70 nodes across 6
+# regions (US weighted heaviest, per Ken 2026-11-13), so the subscription
+# does not balloon to thousands of nodes. Nodes are classified by region
+# from their name first, then from their egress IP country (via the GeoIP
+# mmdb in location.py). Unknown-region nodes only fill the total up to the
+# cap. Fail-safe: on any error the untrimmed list is returned unchanged.
+# Ken 2026-11-13: US first, then JP/SG/KR/TW/HK. EU/MY dropped.
+TRIM_TARGETS = {"US": 20, "JP": 12, "SG": 12, "HK": 10, "TW": 6, "KR": 6}
 
 REGION_PATTERNS = {
     "HK": ["香港", "🇭🇰", "Hong Kong", "HongKong"],
@@ -226,14 +229,119 @@ def _region_from_name(name: str) -> str:
     return ""
 
 
+# Chinese country name (from the MaxMind GeoIP mmdb) -> region code, for
+# egress-IP based classification. CDN egress IPs are never a country
+# (see location.lookup_ip_geo), so Cloudflare-fronted nodes stay unknown
+# instead of being mislabelled as US.
+_COUNTRY_TO_REGION = {
+    "美国": "US",
+    "日本": "JP",
+    "新加坡": "SG",
+    "香港": "HK",
+    "台湾": "TW",
+    "韩国": "KR",
+    "德国": "DE",
+    "英国": "UK",
+    "法国": "FR",
+    "马来西亚": "MY",
+}
+
+
+def _region_from_egress_ip(node: dict, reader) -> str:
+    """Classify a node by its egress IP country (set by the verify step)."""
+    ip = str(node.get("egress_ip", "") or "")
+    if not ip or reader is None:
+        return ""
+    try:
+        geo = location.lookup_ip_geo(ip, reader)
+        if geo.is_cdn or not geo.country:
+            return ""
+        return _COUNTRY_TO_REGION.get(geo.country, "")
+    except Exception as e:
+        logger.warning(f"egress-ip region lookup failed ({e})")
+        return ""
+
+
+def _check_reachable(proxy: dict, port: int) -> "location.ProxyQueryResult":
+    """Real-traffic check: fetch the egress IP through this proxy.
+
+    A node only counts as usable if it can actually carry an HTTP request
+    and return its egress IP. A handshake-only (delay) check is not enough:
+    it lets through nodes with dead UUIDs, wrong paths or server-side bans.
+    """
+    name = str(proxy.get("name", ""))
+    result = location.ProxyInfo(name=name)
+    if not port:
+        return location.ProxyQueryResult(proxy=proxy, result=result, success=False)
+    try:
+        ip = location.resolve_egress_ipv4(
+            port,
+            partial(location.make_proxy_request, quiet=True),
+            max_retries=1,
+            timeout=10,
+        )
+        if not ip:
+            return location.ProxyQueryResult(proxy=proxy, result=result, success=False)
+        proxy["egress_ip"] = ip
+        return location.ProxyQueryResult(proxy=proxy, result=result, success=True)
+    except Exception as e:
+        logger.warning(f"real-traffic check failed for proxy {name}: {e}")
+        return location.ProxyQueryResult(proxy=proxy, result=result, success=False)
+
+
+def verify_reachable_proxies(nodes: list, num_threads: int = 0) -> list:
+    """Drop every proxy that cannot really fetch traffic (fail-safe).
+
+    Starts one mihomo instance with a dedicated HTTP listener per proxy
+    and fetches the egress IP through each of them. Only proxies that
+    return a real egress IP are kept.
+    """
+    if not nodes:
+        return nodes
+    if not location.is_mihomo():
+        logger.warning("mihomo binary not found, skip real-traffic check")
+        return nodes
+    try:
+        results = location.batch_query(
+            proxies=nodes,
+            func=_check_reachable,
+            num_threads=num_threads or 32,
+            show_progress=False,
+            description="Verifying real traffic",
+        )
+        kept = [r.proxy for r in results if r and r.success]
+        logger.info(f"real-traffic check: {len(kept)}/{len(nodes)} proxies can really fetch traffic")
+        if not kept:
+            logger.warning("real-traffic check kept 0 proxies, keep clash-checked nodes instead")
+            return nodes
+        return kept
+    except Exception as e:
+        logger.error(f"real-traffic check failed ({e}), keep clash-checked nodes")
+        return nodes
+
+
 def trim_proxies_by_region(nodes: list, targets: dict = None) -> list:
     try:
         targets = targets or TRIM_TARGETS
         total_cap = sum(targets.values())
+        reader = None
+        if any(isinstance(nd, dict) and nd.get("egress_ip") for nd in nodes):
+            try:
+                os.makedirs(DATA_BASE, exist_ok=True)
+                reader = location.load_mmdb(directory=DATA_BASE, update=False)
+            except Exception as e:
+                logger.warning(f"cannot load geoip mmdb ({e})")
         by_region = {}
         unknown = []
         for nd in nodes:
-            r = _region_from_name(nd.get("name", "")) if isinstance(nd, dict) else ""
+            r = ""
+            if isinstance(nd, dict):
+                # Egress IP is ground truth for where traffic exits; the name
+                # is only a label the source typed (often wrong). Fall back
+                # to the name when there is no egress IP (unverified nodes).
+                r = _region_from_egress_ip(nd, reader)
+                if not r:
+                    r = _region_from_name(nd.get("name", ""))
             if r in targets:
                 by_region.setdefault(r, []).append(nd)
             else:
@@ -370,7 +478,14 @@ def aggregate(args: argparse.Namespace) -> None:
             logger.error(f"cannot fetch any proxy")
             sys.exit(0)
 
-    # Trim to ~50-70 nodes across 10 regions (fail-safe inside).
+    # Ken 2026-11-13: only keep nodes that can REALLY fetch traffic.
+    # The clash delay check only proves a handshake; this step fetches the
+    # egress IP through every surviving proxy and drops the fakes.
+    # Skip-mode (weekly Collect) has no delay filter, so it stays unverified.
+    if not args.skip:
+        nodes = verify_reachable_proxies(nodes, num_threads=args.num)
+
+    # Trim to ~50-70 nodes across 6 regions (fail-safe inside).
     nodes = trim_proxies_by_region(nodes)
 
     subscriptions = set()
