@@ -263,17 +263,31 @@ def _region_from_egress_ip(node: dict, reader) -> str:
 
 
 def _check_reachable(proxy: dict, port: int) -> "location.ProxyQueryResult":
-    """Real-traffic check: fetch the egress IP through this proxy.
+    """Real-traffic check: fetch a real web page through this proxy.
 
-    A node only counts as usable if it can actually carry an HTTP request
-    and return its egress IP. A handshake-only (delay) check is not enough:
-    it lets through nodes with dead UUIDs, wrong paths or server-side bans.
+    A node only counts as usable if it can fetch a real page (not just a
+    10-byte IP echo) fast enough to be useful, and return its egress IP.
+    The old IP-echo-only check was too easy: a node could pass it while
+    being far too slow or broken for real browsing.
     """
     name = str(proxy.get("name", ""))
     result = location.ProxyInfo(name=name)
     if not port:
         return location.ProxyQueryResult(proxy=proxy, result=result, success=False)
     try:
+        started = time.time()
+        ok, body = location.make_proxy_request(
+            port,
+            "https://www.google.com/",
+            max_retries=1,
+            timeout=8,
+            deserialize=False,
+            quiet=True,
+        )
+        fetch_ms = int((time.time() - started) * 1000)
+        if not ok or not body or len(body) < 1024:
+            return location.ProxyQueryResult(proxy=proxy, result=result, success=False)
+        proxy["fetch_ms"] = fetch_ms
         ip = location.resolve_egress_ipv4(
             port,
             partial(location.make_proxy_request, quiet=True),
@@ -349,11 +363,23 @@ def trim_proxies_by_region(nodes: list, targets: dict = None) -> list:
                 unknown.append(nd)
 
         def _rank(nd):
+            # Prefer TLS on 443: it blends with normal HTTPS traffic and
+            # survives the GFW far better than random high ports. Then the
+            # fastest real page fetch, then handshake delay.
+            tls443 = 2
+            if isinstance(nd, dict):
+                if nd.get("tls") and str(nd.get("port", "")) == "443":
+                    tls443 = 0
+                elif nd.get("tls"):
+                    tls443 = 1
+            fetch = nd.get("fetch_ms") if isinstance(nd, dict) else None
+            has_fetch = 0 if isinstance(fetch, (int, float)) else 1
+            f = float(fetch) if isinstance(fetch, (int, float)) else 0.0
             delay = nd.get("delay") if isinstance(nd, dict) else None
             has_delay = 0 if isinstance(delay, (int, float)) else 1
             d = float(delay) if isinstance(delay, (int, float)) else 0.0
             proto = str(nd.get("type", "")).lower() if isinstance(nd, dict) else ""
-            return (has_delay, d, _PROTO_RANK.get(proto, 9))
+            return (tls443, has_fetch, f, has_delay, d, _PROTO_RANK.get(proto, 9))
 
         kept = []
         for code, want in targets.items():
@@ -389,6 +415,7 @@ def trim_proxies_by_region(nodes: list, targets: dict = None) -> list:
             r = nd.pop("_region", "") if isinstance(nd, dict) else ""
             if isinstance(nd, dict):
                 nd.pop("egress_ip", None)
+                nd.pop("fetch_ms", None)
             if r in region_label:
                 counts[r] = counts.get(r, 0) + 1
                 nd["name"] = f"{region_label[r]} {counts[r]:02d}"
