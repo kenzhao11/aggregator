@@ -92,7 +92,9 @@ def generate_conf(
 
         FILE_LOCK.acquire(30)
         try:
-            with open(filepath, "a+", encoding="utf8") as f:
+            # 覆盖写：旧实现用 a+ 追加，重复调用会把 [name] 段写多份，
+            # subconverter 会报 "Duplicate section" 并拒绝生成。
+            with open(filepath, "w+", encoding="utf8") as f:
                 f.write(content)
                 f.flush()
         finally:
@@ -111,7 +113,15 @@ def convert(binname: str, artifact: str = "") -> bool:
         args.append("--artifact")
         args.append(artifact)
 
-    success, _ = utils.cmd(args)
+    # subconverter -g 只从「当前工作目录」读 generate.ini，
+    # 而 generate_conf 把 ini 写在 subconverter 目录下，所以必须先切过去，
+    # 否则报 "cannot found generate.ini" 或静默复用旧配置。
+    cwd = os.getcwd()
+    try:
+        os.chdir(getpath())
+        success, _ = utils.cmd(args)
+    finally:
+        os.chdir(cwd)
     return success
 
 

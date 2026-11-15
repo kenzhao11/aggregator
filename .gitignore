@@ -134,3 +134,7 @@ config.yaml
 generate.ini
 config.json
 config.local.json
+# 本机实测产物（含节点凭据，不入库）
+verify-log/
+best-nodes.yaml
+*.log

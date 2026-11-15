@@ -21,6 +21,7 @@ from enum import Enum
 from http.client import HTTPMessage, HTTPResponse
 from urllib.request import Request
 
+import executable
 import mailtm
 import renewal
 import utils
@@ -828,7 +829,9 @@ class AirPort:
                 return []
 
             time.sleep(random.random())
-            success = subconverter.convert(binname=program, artifact=artifact)
+            # program 传进来的是 clash 内核名，而 convert() 要的是 subconverter 二进制名，
+            # 直接透传会导致 "cannot found bin file: .../subconverter/clash-*.exe"
+            success = subconverter.convert(binname=executable.which_bin()[1], artifact=artifact)
             logger.info(f"subconverter completed, artifact: [{artifact}]\tsuccess=[{success}]")
 
             os.remove(v2ray_file)
